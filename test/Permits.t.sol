@@ -18,7 +18,12 @@ contract PermitsTest is Permit3Test {
         address indexed user, address indexed spender, address indexed token, uint160 amount, uint48 expiration
     );
     event TakerApproval(
-        address indexed user, address indexed module, bytes32 indexed ref, uint160 amount, uint48 expiration
+        address indexed user,
+        address indexed spender,
+        address indexed module,
+        bytes32 ref,
+        uint160 amount,
+        uint48 expiration
     );
 
     address internal constant SPENDER = address(0xB0BB);
@@ -59,6 +64,7 @@ contract PermitsTest is Permit3Test {
         bytes32 ref = keccak256(hex"aa");
         IPermit3.PermitBatch memory batch = takerOnlyBatch(
             IPermit3.TakerPermit({
+                spender: SPENDER,
                 module: address(mod),
                 ref: ref,
                 amount: DEFAULT_AMOUNT,
@@ -70,10 +76,10 @@ contract PermitsTest is Permit3Test {
         bytes memory sig = signBatch(batch, alicePk, DOMAIN_SEPARATOR);
 
         vm.expectEmit(true, true, true, true);
-        emit TakerApproval(alice, address(mod), ref, DEFAULT_AMOUNT, defaultExpiration);
+        emit TakerApproval(alice, SPENDER, address(mod), ref, DEFAULT_AMOUNT, defaultExpiration);
         permit3.permitBatch(alice, batch, sig);
 
-        (uint160 amount,, uint48 nonce) = permit3.takerAllowance(alice, address(mod), ref);
+        (uint160 amount,, uint48 nonce) = permit3.takerAllowance(alice, SPENDER, address(mod), ref);
         assertEq(amount, DEFAULT_AMOUNT);
         assertEq(nonce, 1);
     }
@@ -86,7 +92,7 @@ contract PermitsTest is Permit3Test {
         ts[0] = IPermit3.TokenPermit(SPENDER, address(token0), DEFAULT_AMOUNT, defaultExpiration, 0);
         ts[1] = IPermit3.TokenPermit(SPENDER, address(token1), 2e18, defaultExpiration, 0);
         IPermit3.TakerPermit[] memory rs = new IPermit3.TakerPermit[](1);
-        rs[0] = IPermit3.TakerPermit(address(mod), keccak256(hex"01"), 3e18, defaultExpiration, 0);
+        rs[0] = IPermit3.TakerPermit(SPENDER, address(mod), keccak256(hex"01"), 3e18, defaultExpiration, 0);
 
         IPermit3.PermitBatch memory batch = IPermit3.PermitBatch(ts, rs, defaultDeadline);
         bytes memory sig = signBatch(batch, alicePk, DOMAIN_SEPARATOR);
@@ -94,7 +100,7 @@ contract PermitsTest is Permit3Test {
 
         (uint160 a0,, uint48 n0) = permit3.tokenAllowance(alice, SPENDER, address(token0));
         (uint160 a1,, uint48 n1) = permit3.tokenAllowance(alice, SPENDER, address(token1));
-        (uint160 a2,, uint48 n2) = permit3.takerAllowance(alice, address(mod), keccak256(hex"01"));
+        (uint160 a2,, uint48 n2) = permit3.takerAllowance(alice, SPENDER, address(mod), keccak256(hex"01"));
         assertEq(a0, DEFAULT_AMOUNT);
         assertEq(a1, 2e18);
         assertEq(a2, 3e18);

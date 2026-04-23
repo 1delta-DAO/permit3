@@ -8,24 +8,38 @@ import {MockTakerModule, ReentrantTakerModule, PullingTakerModule} from "./mocks
 
 /// @notice Permit3-specific tests for the taker book — the surface that does
 ///         not exist in Permit2. Covers approveTaker/take/revokeTaker, ref =
-///         keccak256(data) dispatch, reentrancy, and invalidateTakerNonces.
+///         keccak256(data) dispatch, spender scoping, reentrancy, and
+///         invalidateTakerNonces.
 contract TakerBookTest is Permit3Test {
     event TakerApproval(
-        address indexed user, address indexed module, bytes32 indexed ref, uint160 amount, uint48 expiration
+        address indexed user,
+        address indexed spender,
+        address indexed module,
+        bytes32 ref,
+        uint160 amount,
+        uint48 expiration
     );
     event TakerNonceInvalidation(
-        address indexed user, address indexed module, bytes32 indexed ref, uint48 newNonce, uint48 oldNonce
+        address indexed user,
+        address indexed spender,
+        address indexed module,
+        bytes32 ref,
+        uint48 newNonce,
+        uint48 oldNonce
     );
 
     MockERC20 internal borrowToken;
     MockTakerModule internal module;
 
     address internal constant RECEIVER = address(0xBEEF);
+    // Test contract is the default `take` caller, so it's also the spender.
+    address internal spender;
 
     function setUp() public {
         _baseSetup();
         borrowToken = new MockERC20();
         module = new MockTakerModule(address(permit3), address(borrowToken));
+        spender = address(this);
     }
 
     // ──────────────────── approveTaker / view ────────────────────
@@ -36,10 +50,11 @@ contract TakerBookTest is Permit3Test {
 
         vm.prank(alice);
         vm.expectEmit(true, true, true, true);
-        emit TakerApproval(alice, address(module), ref, DEFAULT_AMOUNT, defaultExpiration);
-        permit3.approveTaker(address(module), ref, DEFAULT_AMOUNT, defaultExpiration);
+        emit TakerApproval(alice, spender, address(module), ref, DEFAULT_AMOUNT, defaultExpiration);
+        permit3.approveTaker(spender, address(module), ref, DEFAULT_AMOUNT, defaultExpiration);
 
-        (uint160 amount, uint48 expiration, uint48 nonce) = permit3.takerAllowance(alice, address(module), ref);
+        (uint160 amount, uint48 expiration, uint48 nonce) =
+            permit3.takerAllowance(alice, spender, address(module), ref);
         assertEq(amount, DEFAULT_AMOUNT);
         assertEq(expiration, defaultExpiration);
         assertEq(nonce, 0);
@@ -52,7 +67,7 @@ contract TakerBookTest is Permit3Test {
         bytes32 ref = keccak256(data);
 
         vm.prank(alice);
-        permit3.approveTaker(address(module), ref, DEFAULT_AMOUNT, defaultExpiration);
+        permit3.approveTaker(spender, address(module), ref, DEFAULT_AMOUNT, defaultExpiration);
 
         permit3.take(address(module), alice, 0.4e18, RECEIVER, data);
 
@@ -68,12 +83,26 @@ contract TakerBookTest is Permit3Test {
         bytes memory data = abi.encode(uint256(1));
         bytes32 ref = keccak256(data);
         vm.prank(alice);
-        permit3.approveTaker(address(module), ref, 1e18, defaultExpiration);
+        permit3.approveTaker(spender, address(module), ref, 1e18, defaultExpiration);
 
         permit3.take(address(module), alice, 0.3e18, RECEIVER, data);
 
-        (uint160 amount,,) = permit3.takerAllowance(alice, address(module), ref);
+        (uint160 amount,,) = permit3.takerAllowance(alice, spender, address(module), ref);
         assertEq(amount, 1e18 - 0.3e18);
+    }
+
+    /// @dev An unauthorised caller hits a zero allowance on (user, caller, module, ref)
+    ///      and reverts with `InsufficientAllowance(0)` — this is the spender gate.
+    function testTakeRequiresApprovedSpender() public {
+        bytes memory data = abi.encode(uint256(0xFEED));
+        bytes32 ref = keccak256(data);
+        vm.prank(alice);
+        permit3.approveTaker(spender, address(module), ref, 1e18, defaultExpiration);
+
+        address intruder = address(0xDEAD);
+        vm.prank(intruder);
+        vm.expectRevert(abi.encodeWithSelector(IPermit3.InsufficientAllowance.selector, uint160(0)));
+        permit3.take(address(module), alice, 1, RECEIVER, data);
     }
 
     /// @dev Any change to `data` changes the ref, so the other ref's
@@ -82,7 +111,7 @@ contract TakerBookTest is Permit3Test {
         bytes memory dataA = abi.encode(uint256(1));
         bytes memory dataB = abi.encode(uint256(2));
         vm.prank(alice);
-        permit3.approveTaker(address(module), keccak256(dataA), 1e18, defaultExpiration);
+        permit3.approveTaker(spender, address(module), keccak256(dataA), 1e18, defaultExpiration);
 
         vm.expectRevert(abi.encodeWithSelector(IPermit3.InsufficientAllowance.selector, uint160(0)));
         permit3.take(address(module), alice, 1, RECEIVER, dataB);
@@ -92,7 +121,7 @@ contract TakerBookTest is Permit3Test {
         bytes memory data = hex"aabb";
         bytes32 ref = keccak256(data);
         vm.prank(alice);
-        permit3.approveTaker(address(module), ref, 1e18, defaultExpiration);
+        permit3.approveTaker(spender, address(module), ref, 1e18, defaultExpiration);
 
         vm.warp(uint256(defaultExpiration) + 1);
 
@@ -103,7 +132,7 @@ contract TakerBookTest is Permit3Test {
     function testTakeInsufficientAllowanceReverts() public {
         bytes memory data = hex"bb";
         vm.prank(alice);
-        permit3.approveTaker(address(module), keccak256(data), 1e18, defaultExpiration);
+        permit3.approveTaker(spender, address(module), keccak256(data), 1e18, defaultExpiration);
 
         vm.expectRevert(abi.encodeWithSelector(IPermit3.InsufficientAllowance.selector, uint160(1e18)));
         permit3.take(address(module), alice, 1e18 + 1, RECEIVER, data);
@@ -113,25 +142,27 @@ contract TakerBookTest is Permit3Test {
         bytes memory data = hex"cc";
         bytes32 ref = keccak256(data);
         vm.prank(alice);
-        permit3.approveTaker(address(module), ref, type(uint160).max, 0);
+        permit3.approveTaker(spender, address(module), ref, type(uint160).max, 0);
 
         permit3.take(address(module), alice, 1e18, RECEIVER, data);
         permit3.take(address(module), alice, 2e18, RECEIVER, data);
 
-        (uint160 amount,,) = permit3.takerAllowance(alice, address(module), ref);
+        (uint160 amount,,) = permit3.takerAllowance(alice, spender, address(module), ref);
         assertEq(amount, type(uint160).max);
     }
 
     /// @dev Permit3.take is `nonReentrant`; a module that tries to re-enter
-    ///      take() must revert.
+    ///      take() must revert. Both the outer caller and the inner re-entry
+    ///      happen as the reentrant module, which is its own approved spender.
     function testTakeRejectsReentrancy() public {
         ReentrantTakerModule reentrant = new ReentrantTakerModule(address(permit3));
         bytes memory data = hex"dd";
         bytes32 ref = keccak256(data);
         vm.prank(alice);
-        permit3.approveTaker(address(reentrant), ref, type(uint160).max, 0);
+        permit3.approveTaker(address(reentrant), address(reentrant), ref, type(uint160).max, 0);
 
         vm.expectRevert(IPermit3.Reentrancy.selector);
+        vm.prank(address(reentrant));
         permit3.take(address(reentrant), alice, 1, RECEIVER, data);
     }
 
@@ -145,7 +176,7 @@ contract TakerBookTest is Permit3Test {
         bytes32 ref = keccak256(data);
 
         vm.startPrank(alice);
-        permit3.approveTaker(address(pulling), ref, 1e18, defaultExpiration);
+        permit3.approveTaker(spender, address(pulling), ref, 1e18, defaultExpiration);
         permit3.approveToken(address(pulling), address(token0), 1e18, defaultExpiration);
         vm.stopPrank();
 
@@ -154,7 +185,7 @@ contract TakerBookTest is Permit3Test {
         assertEq(token0.balanceOf(RECEIVER), before + 0.5e18);
 
         // Both books are decremented independently.
-        (uint160 takerAmt,,) = permit3.takerAllowance(alice, address(pulling), ref);
+        (uint160 takerAmt,,) = permit3.takerAllowance(alice, spender, address(pulling), ref);
         (uint160 tokenAmt,,) = permit3.tokenAllowance(alice, address(pulling), address(token0));
         assertEq(takerAmt, 0.5e18);
         assertEq(tokenAmt, 0.5e18);
@@ -165,14 +196,14 @@ contract TakerBookTest is Permit3Test {
     function testRevokeTakerZeroesAllowance() public {
         bytes32 ref = keccak256(hex"01");
         vm.prank(alice);
-        permit3.approveTaker(address(module), ref, 1e18, defaultExpiration);
+        permit3.approveTaker(spender, address(module), ref, 1e18, defaultExpiration);
 
         vm.prank(alice);
         vm.expectEmit(true, true, true, true);
-        emit TakerApproval(alice, address(module), ref, 0, 0);
-        permit3.revokeTaker(address(module), ref);
+        emit TakerApproval(alice, spender, address(module), ref, 0, 0);
+        permit3.revokeTaker(spender, address(module), ref);
 
-        (uint160 amount, uint48 expiration,) = permit3.takerAllowance(alice, address(module), ref);
+        (uint160 amount, uint48 expiration,) = permit3.takerAllowance(alice, spender, address(module), ref);
         assertEq(amount, 0);
         assertEq(expiration, 0);
     }
@@ -180,12 +211,12 @@ contract TakerBookTest is Permit3Test {
     function testRevokeTakerPreservesNonce() public {
         bytes32 ref = keccak256(hex"02");
         vm.startPrank(alice);
-        permit3.invalidateTakerNonces(address(module), ref, 4);
-        permit3.approveTaker(address(module), ref, 1e18, defaultExpiration);
-        permit3.revokeTaker(address(module), ref);
+        permit3.invalidateTakerNonces(spender, address(module), ref, 4);
+        permit3.approveTaker(spender, address(module), ref, 1e18, defaultExpiration);
+        permit3.revokeTaker(spender, address(module), ref);
         vm.stopPrank();
 
-        (,, uint48 nonce) = permit3.takerAllowance(alice, address(module), ref);
+        (,, uint48 nonce) = permit3.takerAllowance(alice, spender, address(module), ref);
         assertEq(nonce, 4);
     }
 
@@ -195,27 +226,27 @@ contract TakerBookTest is Permit3Test {
         bytes32 ref = keccak256(hex"03");
         vm.prank(alice);
         vm.expectEmit(true, true, true, true);
-        emit TakerNonceInvalidation(alice, address(module), ref, 3, 0);
-        permit3.invalidateTakerNonces(address(module), ref, 3);
+        emit TakerNonceInvalidation(alice, spender, address(module), ref, 3, 0);
+        permit3.invalidateTakerNonces(spender, address(module), ref, 3);
 
-        (,, uint48 nonce) = permit3.takerAllowance(alice, address(module), ref);
+        (,, uint48 nonce) = permit3.takerAllowance(alice, spender, address(module), ref);
         assertEq(nonce, 3);
     }
 
     function testInvalidateTakerNoncesMustBeForward() public {
         bytes32 ref = keccak256(hex"04");
         vm.prank(alice);
-        permit3.invalidateTakerNonces(address(module), ref, 2);
+        permit3.invalidateTakerNonces(spender, address(module), ref, 2);
 
         vm.prank(alice);
         vm.expectRevert(IPermit3.InvalidPermitNonce.selector);
-        permit3.invalidateTakerNonces(address(module), ref, 2);
+        permit3.invalidateTakerNonces(spender, address(module), ref, 2);
     }
 
     function testInvalidateTakerNoncesExcessiveReverts() public {
         bytes32 ref = keccak256(hex"05");
         vm.prank(alice);
         vm.expectRevert(IPermit3.ExcessiveInvalidation.selector);
-        permit3.invalidateTakerNonces(address(module), ref, uint48(type(uint16).max) + 1);
+        permit3.invalidateTakerNonces(spender, address(module), ref, uint48(type(uint16).max) + 1);
     }
 }

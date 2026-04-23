@@ -11,18 +11,20 @@ import {ITakerModule} from "../interfaces/ITakerModule.sol";
 ///
 ///  Design
 ///  ──────
-///  Permit3 holds two allowance books:
+///  Permit3 holds two allowance books, both keyed on an explicit spender:
 ///
 ///    • token book — keyed (user → spender → token). A spender calls
 ///      `transferFrom(user, to, token, amount)`; Permit3 decrements the
 ///      spender's allowance and calls the token's ERC20 transferFrom.
 ///      Permit2-equivalent.
 ///
-///    • taker book — keyed (user → module → bytes32 ref). An arbitrary
-///      caller invokes `take(module, user, amount, receiver, data)`;
-///      Permit3 computes `ref = keccak256(data)`, decrements the user's
-///      allowance on (module, ref), then invokes the module's
-///      `takeOnBehalf`. The module performs the protocol-native call.
+///    • taker book — keyed (user → spender → module → bytes32 ref). The
+///      approved `spender` (typically a settlement contract) invokes
+///      `take(module, user, amount, receiver, data)`; Permit3 computes
+///      `ref = keccak256(data)`, decrements the allowance on
+///      (user, msg.sender, module, ref), then invokes the module's
+///      `takeOnBehalf`. Any caller whose msg.sender does not match the
+///      approved spender slot has a zero allowance and cannot dispatch.
 ///
 ///  Permit3 knows nothing about lending/staking/vault protocols. Protocol
 ///  heterogeneity stays in modules. Single-operation modules keep blast
@@ -40,11 +42,13 @@ contract Permit3 is IPermit3 {
     /// @dev user → spender → token → (amount, expiration, nonce)
     mapping(address => mapping(address => mapping(address => PackedAllowance))) private _tokenAllowance;
 
-    /// @dev user → module → ref → (amount, expiration, nonce).
-    ///      `ref` is opaque to Permit3 — a module-specific position key
-    ///      (Morpho marketId, Comet address, Aave (asset, rateMode), LST
+    /// @dev user → spender → module → ref → (amount, expiration, nonce).
+    ///      `spender` is the address permitted to invoke `take`. `ref` is
+    ///      opaque to Permit3 — a module-specific position key (Morpho
+    ///      marketId, Comet address, Aave (asset, rateMode), LST
     ///      withdrawal NFT id, …).
-    mapping(address => mapping(address => mapping(bytes32 => PackedAllowance))) private _takerAllowance;
+    mapping(address => mapping(address => mapping(address => mapping(bytes32 => PackedAllowance)))) private
+        _takerAllowance;
 
     /// @notice EIP-712 domain separator for signed permits.
     bytes32 public immutable override DOMAIN_SEPARATOR;
@@ -53,17 +57,16 @@ contract Permit3 is IPermit3 {
 
     // ──────────────────── EIP-712 typehashes ────────────────────
 
-    bytes32 private constant _TOKEN_PERMIT_TYPEHASH = keccak256(
-        "TokenPermit(address spender,address token,uint160 amount,uint48 expiration,uint48 nonce)"
-    );
+    bytes32 private constant _TOKEN_PERMIT_TYPEHASH =
+        keccak256("TokenPermit(address spender,address token,uint160 amount,uint48 expiration,uint48 nonce)");
 
     bytes32 private constant _TAKER_PERMIT_TYPEHASH = keccak256(
-        "TakerPermit(address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)"
+        "TakerPermit(address spender,address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)"
     );
 
     bytes32 private constant _PERMIT_BATCH_TYPEHASH = keccak256(
         "PermitBatch(TokenPermit[] tokens,TakerPermit[] takers,uint256 deadline)"
-        "TakerPermit(address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)"
+        "TakerPermit(address spender,address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)"
         "TokenPermit(address spender,address token,uint160 amount,uint48 expiration,uint48 nonce)"
     );
 
@@ -130,11 +133,14 @@ contract Permit3 is IPermit3 {
 
     // ──────────────────── Taker side ────────────────────
 
-    function approveTaker(address module, bytes32 ref, uint160 amount, uint48 expiration) external override {
-        PackedAllowance storage a = _takerAllowance[msg.sender][module][ref];
+    function approveTaker(address spender, address module, bytes32 ref, uint160 amount, uint48 expiration)
+        external
+        override
+    {
+        PackedAllowance storage a = _takerAllowance[msg.sender][spender][module][ref];
         a.amount = amount;
         a.expiration = expiration;
-        emit TakerApproval(msg.sender, module, ref, amount, expiration);
+        emit TakerApproval(msg.sender, spender, module, ref, amount, expiration);
     }
 
     function take(address module, address user, uint160 amount, address receiver, bytes calldata data)
@@ -143,17 +149,17 @@ contract Permit3 is IPermit3 {
         nonReentrant
     {
         bytes32 ref = keccak256(data);
-        _spend(_takerAllowance[user][module][ref], amount);
+        _spend(_takerAllowance[user][msg.sender][module][ref], amount);
         ITakerModule(module).takeOnBehalf(user, amount, receiver, data);
     }
 
-    function takerAllowance(address user, address module, bytes32 ref)
+    function takerAllowance(address user, address spender, address module, bytes32 ref)
         external
         view
         override
         returns (uint160 amount, uint48 expiration, uint48 nonce)
     {
-        PackedAllowance storage a = _takerAllowance[user][module][ref];
+        PackedAllowance storage a = _takerAllowance[user][spender][module][ref];
         return (a.amount, a.expiration, a.nonce);
     }
 
@@ -166,11 +172,11 @@ contract Permit3 is IPermit3 {
         emit TokenApproval(msg.sender, spender, token, 0, 0);
     }
 
-    function revokeTaker(address module, bytes32 ref) external override {
-        PackedAllowance storage a = _takerAllowance[msg.sender][module][ref];
+    function revokeTaker(address spender, address module, bytes32 ref) external override {
+        PackedAllowance storage a = _takerAllowance[msg.sender][spender][module][ref];
         a.amount = 0;
         a.expiration = 0;
-        emit TakerApproval(msg.sender, module, ref, 0, 0);
+        emit TakerApproval(msg.sender, spender, module, ref, 0, 0);
     }
 
     function lockdown(address spender) external override {
@@ -192,15 +198,15 @@ contract Permit3 is IPermit3 {
         emit TokenNonceInvalidation(msg.sender, spender, token, newNonce, old);
     }
 
-    function invalidateTakerNonces(address module, bytes32 ref, uint48 newNonce) external override {
-        PackedAllowance storage a = _takerAllowance[msg.sender][module][ref];
+    function invalidateTakerNonces(address spender, address module, bytes32 ref, uint48 newNonce) external override {
+        PackedAllowance storage a = _takerAllowance[msg.sender][spender][module][ref];
         uint48 old = a.nonce;
         if (newNonce <= old) revert InvalidPermitNonce();
         unchecked {
             if (newNonce - old > _MAX_NONCE_INCREMENT) revert ExcessiveInvalidation();
         }
         a.nonce = newNonce;
-        emit TakerNonceInvalidation(msg.sender, module, ref, newNonce, old);
+        emit TakerNonceInvalidation(msg.sender, spender, module, ref, newNonce, old);
     }
 
     // ──────────────────── Signed permits ────────────────────
@@ -266,6 +272,7 @@ contract Permit3 is IPermit3 {
             hashes[i] = keccak256(
                 abi.encode(
                     _TAKER_PERMIT_TYPEHASH,
+                    permits[i].spender,
                     permits[i].module,
                     permits[i].ref,
                     permits[i].amount,
@@ -331,14 +338,14 @@ contract Permit3 is IPermit3 {
         }
         for (uint256 i; i < batch.takers.length; i++) {
             TakerPermit calldata p = batch.takers[i];
-            PackedAllowance storage a = _takerAllowance[owner][p.module][p.ref];
+            PackedAllowance storage a = _takerAllowance[owner][p.spender][p.module][p.ref];
             if (p.nonce != a.nonce) revert InvalidPermitNonce();
             a.amount = p.amount;
             a.expiration = p.expiration;
             unchecked {
                 a.nonce = p.nonce + 1;
             }
-            emit TakerApproval(owner, p.module, p.ref, p.amount, p.expiration);
+            emit TakerApproval(owner, p.spender, p.module, p.ref, p.amount, p.expiration);
         }
     }
 

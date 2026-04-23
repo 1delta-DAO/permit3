@@ -18,12 +18,13 @@ contract Permit3Signature {
     bytes32 internal constant TOKEN_PERMIT_TYPEHASH =
         keccak256("TokenPermit(address spender,address token,uint160 amount,uint48 expiration,uint48 nonce)");
 
-    bytes32 internal constant TAKER_PERMIT_TYPEHASH =
-        keccak256("TakerPermit(address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)");
+    bytes32 internal constant TAKER_PERMIT_TYPEHASH = keccak256(
+        "TakerPermit(address spender,address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)"
+    );
 
     bytes32 internal constant PERMIT_BATCH_TYPEHASH = keccak256(
         "PermitBatch(TokenPermit[] tokens,TakerPermit[] takers,uint256 deadline)"
-        "TakerPermit(address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)"
+        "TakerPermit(address spender,address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)"
         "TokenPermit(address spender,address token,uint160 amount,uint48 expiration,uint48 nonce)"
     );
 
@@ -55,6 +56,7 @@ contract Permit3Signature {
             hashes[i] = keccak256(
                 abi.encode(
                     TAKER_PERMIT_TYPEHASH,
+                    permits[i].spender,
                     permits[i].module,
                     permits[i].ref,
                     permits[i].amount,

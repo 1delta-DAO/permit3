@@ -7,6 +7,11 @@ pragma solidity ^0.8.28;
 ///         • taker book — Taker module pulls value from a user's position
 ///           (borrow, withdraw, unstake, claim, …) via Permit3.take(…).
 ///
+///         Both books are keyed by a `spender` address. For the taker book
+///         that spender is the settlement contract authorised to invoke
+///         `take`; Permit3 enforces `msg.sender == spender`, so an attacker
+///         cannot dispatch `take` outside the settlement's validated flow.
+///
 ///         Users approve Permit3 once per asset/module and tune caps per order.
 interface IPermit3 {
     struct PackedAllowance {
@@ -26,6 +31,7 @@ interface IPermit3 {
     }
 
     struct TakerPermit {
+        address spender;
         address module;
         bytes32 ref;
         uint160 amount;
@@ -44,14 +50,29 @@ interface IPermit3 {
     event TokenApproval(
         address indexed user, address indexed spender, address indexed token, uint160 amount, uint48 expiration
     );
+    /// @dev `module` and `ref` identify the position; `spender` is the
+    ///      only address Permit3 will accept as `msg.sender` of `take`.
+    ///      Solidity allows only 3 indexed topics — we keep the three
+    ///      routable keys (user, spender, module) indexed and leave `ref`
+    ///      in data; consumers filter by `module` first and `ref` second.
     event TakerApproval(
-        address indexed user, address indexed module, bytes32 indexed ref, uint160 amount, uint48 expiration
+        address indexed user,
+        address indexed spender,
+        address indexed module,
+        bytes32 ref,
+        uint160 amount,
+        uint48 expiration
     );
     event TokenNonceInvalidation(
         address indexed user, address indexed spender, address indexed token, uint48 newNonce, uint48 oldNonce
     );
     event TakerNonceInvalidation(
-        address indexed user, address indexed module, bytes32 indexed ref, uint48 newNonce, uint48 oldNonce
+        address indexed user,
+        address indexed spender,
+        address indexed module,
+        bytes32 ref,
+        uint48 newNonce,
+        uint48 oldNonce
     );
     event Lockdown(address indexed user, address spender);
 
@@ -78,21 +99,21 @@ interface IPermit3 {
 
     // ──────────────────── Taker side ────────────────────
     //
-    // `ref` is a module-defined opaque key identifying the position the
-    // operation touches. The op itself is identified by the module's address
-    // (single-operation modules). Refs are computed by
-    // `ITakerModule.takerKey(asset, data)` so they are reproducible off-chain.
+    // Keyed by `(user, spender, module, ref)` where `ref = keccak256(data)`.
+    // `spender` is the address Permit3 will accept as `msg.sender` of
+    // `take` — typically the settlement contract the user has chosen to
+    // dispatch fills. `module` identifies the single-op adapter; `ref`
+    // identifies the position.
 
-    function approveTaker(address module, bytes32 ref, uint160 amount, uint48 expiration) external;
+    function approveTaker(address spender, address module, bytes32 ref, uint160 amount, uint48 expiration) external;
 
-    /// @notice Amount-gated dispatch: decrements the user's allowance on
-    ///         (user, module, ref) where `ref = keccak256(data)`, then
-    ///         invokes `module.takeOnBehalf(user, amount, receiver, data)`.
-    ///         Any address may call — the security boundary is the maker's
-    ///         per-module allowance. Asset identity is encoded inside `data`.
+    /// @notice Amount-gated dispatch: requires `msg.sender` to hold the
+    ///         approved spender slot, decrements the allowance on
+    ///         (user, msg.sender, module, keccak256(data)), then invokes
+    ///         `module.takeOnBehalf(user, amount, receiver, data)`.
     function take(address module, address user, uint160 amount, address receiver, bytes calldata data) external;
 
-    function takerAllowance(address user, address module, bytes32 ref)
+    function takerAllowance(address user, address spender, address module, bytes32 ref)
         external
         view
         returns (uint160 amount, uint48 expiration, uint48 nonce);
@@ -101,7 +122,7 @@ interface IPermit3 {
 
     function revokeToken(address spender, address token) external;
 
-    function revokeTaker(address module, bytes32 ref) external;
+    function revokeTaker(address spender, address module, bytes32 ref) external;
 
     function lockdown(address spender) external;
 
@@ -143,8 +164,8 @@ interface IPermit3 {
     ///         bound matching Permit2).
     function invalidateTokenNonces(address spender, address token, uint48 newNonce) external;
 
-    /// @notice Advance the per-allowance nonce of `(caller, module, ref)`.
+    /// @notice Advance the per-allowance nonce of `(caller, spender, module, ref)`.
     ///         Same semantics as `invalidateTokenNonces` but for the taker
     ///         book.
-    function invalidateTakerNonces(address module, bytes32 ref, uint48 newNonce) external;
+    function invalidateTakerNonces(address spender, address module, bytes32 ref, uint48 newNonce) external;
 }
