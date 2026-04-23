@@ -33,6 +33,9 @@ import {ITakerModule} from "../interfaces/ITakerModule.sol";
 ///  supported. Signed permits may bind an arbitrary witness (e.g. an order
 ///  hash) via `permitBatchWithWitness`, so a single signature can cover
 ///  both a batch of allowances and the order that will consume them.
+///
+///  Signatures accept 65-byte `(r,s,v)`, 64-byte EIP-2098 compact, and
+///  EIP-1271 smart-account signatures. ECDSA is low-s enforced.
 contract Permit3 is IPermit3 {
     /// @dev user → spender → token → (amount, expiration, nonce)
     mapping(address => mapping(address => mapping(address => PackedAllowance))) private _tokenAllowance;
@@ -43,9 +46,6 @@ contract Permit3 is IPermit3 {
     ///      withdrawal NFT id, …).
     mapping(address => mapping(address => mapping(bytes32 => PackedAllowance))) private _takerAllowance;
 
-    /// @notice Permit replay-protection: owner → wordIndex → bitmap of used nonces.
-    mapping(address => mapping(uint256 => uint256)) public permitNonceBitmap;
-
     /// @notice EIP-712 domain separator for signed permits.
     bytes32 public immutable override DOMAIN_SEPARATOR;
 
@@ -53,22 +53,36 @@ contract Permit3 is IPermit3 {
 
     // ──────────────────── EIP-712 typehashes ────────────────────
 
-    bytes32 private constant _TOKEN_PERMIT_TYPEHASH =
-        keccak256("TokenPermit(address spender,address token,uint160 amount,uint48 expiration)");
+    bytes32 private constant _TOKEN_PERMIT_TYPEHASH = keccak256(
+        "TokenPermit(address spender,address token,uint160 amount,uint48 expiration,uint48 nonce)"
+    );
 
-    bytes32 private constant _TAKER_PERMIT_TYPEHASH =
-        keccak256("TakerPermit(address module,bytes32 ref,uint160 amount,uint48 expiration)");
+    bytes32 private constant _TAKER_PERMIT_TYPEHASH = keccak256(
+        "TakerPermit(address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)"
+    );
 
     bytes32 private constant _PERMIT_BATCH_TYPEHASH = keccak256(
-        "PermitBatch(TokenPermit[] tokens,TakerPermit[] takers,uint256 nonce,uint256 deadline)"
-        "TakerPermit(address module,bytes32 ref,uint160 amount,uint48 expiration)"
-        "TokenPermit(address spender,address token,uint160 amount,uint48 expiration)"
+        "PermitBatch(TokenPermit[] tokens,TakerPermit[] takers,uint256 deadline)"
+        "TakerPermit(address module,bytes32 ref,uint160 amount,uint48 expiration,uint48 nonce)"
+        "TokenPermit(address spender,address token,uint160 amount,uint48 expiration,uint48 nonce)"
     );
 
     /// @dev Type-string stub for the witness-bound batch. The caller appends
     ///      its own `"<fieldName> <WitnessType>)<TYPES IN ALPHABETICAL ORDER>"`.
     string private constant _PERMIT_BATCH_WITNESS_STUB =
-        "PermitBatchWitness(TokenPermit[] tokens,TakerPermit[] takers,uint256 nonce,uint256 deadline,";
+        "PermitBatchWitness(TokenPermit[] tokens,TakerPermit[] takers,uint256 deadline,";
+
+    // ──────────────────── Signature constants ────────────────────
+
+    /// @dev secp256k1 curve order / 2. `s` above this is malleable.
+    uint256 private constant _SECP256K1_HALF_N =
+        0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+
+    /// @dev EIP-1271 magic return value for a valid signature.
+    bytes4 private constant _ERC1271_MAGIC_VALUE = 0x1626ba7e;
+
+    /// @dev Bump cap for `invalidate*Nonces` (matches Permit2).
+    uint48 private constant _MAX_NONCE_INCREMENT = type(uint16).max;
 
     constructor() {
         DOMAIN_SEPARATOR = keccak256(
@@ -146,12 +160,16 @@ contract Permit3 is IPermit3 {
     // ──────────────────── Revocation ────────────────────
 
     function revokeToken(address spender, address token) external override {
-        delete _tokenAllowance[msg.sender][spender][token];
+        PackedAllowance storage a = _tokenAllowance[msg.sender][spender][token];
+        a.amount = 0;
+        a.expiration = 0;
         emit TokenApproval(msg.sender, spender, token, 0, 0);
     }
 
     function revokeTaker(address module, bytes32 ref) external override {
-        delete _takerAllowance[msg.sender][module][ref];
+        PackedAllowance storage a = _takerAllowance[msg.sender][module][ref];
+        a.amount = 0;
+        a.expiration = 0;
         emit TakerApproval(msg.sender, module, ref, 0, 0);
     }
 
@@ -159,6 +177,30 @@ contract Permit3 is IPermit3 {
         // Intent-only signal; callers sweep specific (token, ref) pairs via
         // revokeToken / revokeTaker using their off-chain-indexed list.
         emit Lockdown(msg.sender, spender);
+    }
+
+    // ──────────────────── Nonce invalidation ────────────────────
+
+    function invalidateTokenNonces(address spender, address token, uint48 newNonce) external override {
+        PackedAllowance storage a = _tokenAllowance[msg.sender][spender][token];
+        uint48 old = a.nonce;
+        if (newNonce <= old) revert InvalidPermitNonce();
+        unchecked {
+            if (newNonce - old > _MAX_NONCE_INCREMENT) revert ExcessiveInvalidation();
+        }
+        a.nonce = newNonce;
+        emit TokenNonceInvalidation(msg.sender, spender, token, newNonce, old);
+    }
+
+    function invalidateTakerNonces(address module, bytes32 ref, uint48 newNonce) external override {
+        PackedAllowance storage a = _takerAllowance[msg.sender][module][ref];
+        uint48 old = a.nonce;
+        if (newNonce <= old) revert InvalidPermitNonce();
+        unchecked {
+            if (newNonce - old > _MAX_NONCE_INCREMENT) revert ExcessiveInvalidation();
+        }
+        a.nonce = newNonce;
+        emit TakerNonceInvalidation(msg.sender, module, ref, newNonce, old);
     }
 
     // ──────────────────── Signed permits ────────────────────
@@ -170,14 +212,11 @@ contract Permit3 is IPermit3 {
                 _PERMIT_BATCH_TYPEHASH,
                 _hashTokenPermits(batch.tokens),
                 _hashTakerPermits(batch.takers),
-                batch.nonce,
                 batch.deadline
             )
         );
         _verifyPermitSig(owner, hashStruct, sig);
-        _usePermitNonce(owner, batch.nonce);
         _applyBatch(owner, batch);
-        emit PermitBatchApplied(owner, batch.nonce);
     }
 
     function permitBatchWithWitness(
@@ -194,19 +233,12 @@ contract Permit3 is IPermit3 {
                 typeHash,
                 _hashTokenPermits(batch.tokens),
                 _hashTakerPermits(batch.takers),
-                batch.nonce,
                 batch.deadline,
                 witness
             )
         );
         _verifyPermitSig(owner, hashStruct, sig);
-        _usePermitNonce(owner, batch.nonce);
         _applyBatch(owner, batch);
-        emit PermitBatchApplied(owner, batch.nonce);
-    }
-
-    function isPermitNonceUsed(address owner, uint256 nonce) external view override returns (bool) {
-        return (permitNonceBitmap[owner][nonce >> 8] & (1 << (nonce & 0xff))) != 0;
     }
 
     // ──────────────────── Permit internals ────────────────────
@@ -220,7 +252,8 @@ contract Permit3 is IPermit3 {
                     permits[i].spender,
                     permits[i].token,
                     permits[i].amount,
-                    permits[i].expiration
+                    permits[i].expiration,
+                    permits[i].nonce
                 )
             );
         }
@@ -236,44 +269,75 @@ contract Permit3 is IPermit3 {
                     permits[i].module,
                     permits[i].ref,
                     permits[i].amount,
-                    permits[i].expiration
+                    permits[i].expiration,
+                    permits[i].nonce
                 )
             );
         }
         return keccak256(abi.encodePacked(hashes));
     }
 
+    /// @dev Verify `sig` over the EIP-712 digest of `hashStruct`.
+    ///      Supports 65-byte `(r,s,v)`, 64-byte EIP-2098 compact, and
+    ///      EIP-1271 smart-account signatures. ECDSA is low-s only.
     function _verifyPermitSig(address owner, bytes32 hashStruct, bytes calldata sig) private view {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, hashStruct));
-        bytes32 r = bytes32(sig[0:32]);
-        bytes32 s = bytes32(sig[32:64]);
-        uint8 v = uint8(sig[64]);
-        address signer = ecrecover(digest, v, r, s);
-        if (signer == address(0) || signer != owner) revert InvalidPermitSignature();
-    }
 
-    function _usePermitNonce(address owner, uint256 nonce) private {
-        uint256 wordIndex = nonce >> 8;
-        uint256 bitIndex = nonce & 0xff;
-        uint256 mask = 1 << bitIndex;
-        uint256 word = permitNonceBitmap[owner][wordIndex];
-        if (word & mask != 0) revert PermitNonceUsed();
-        permitNonceBitmap[owner][wordIndex] = word | mask;
+        if (owner.code.length == 0) {
+            // EOA: recover via ecrecover with malleability guard.
+            bytes32 r;
+            bytes32 s;
+            uint8 v;
+
+            if (sig.length == 65) {
+                r = bytes32(sig[0:32]);
+                s = bytes32(sig[32:64]);
+                v = uint8(sig[64]);
+            } else if (sig.length == 64) {
+                // EIP-2098 compact: (r, vs) where vs = (v-27) << 255 | s
+                r = bytes32(sig[0:32]);
+                bytes32 vs = bytes32(sig[32:64]);
+                s = vs & bytes32(uint256(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff));
+                v = 27 + uint8(uint256(vs) >> 255);
+            } else {
+                revert InvalidPermitSignature();
+            }
+
+            if (uint256(s) > _SECP256K1_HALF_N) revert InvalidPermitSignature();
+            if (v != 27 && v != 28) revert InvalidPermitSignature();
+
+            address recovered = ecrecover(digest, v, r, s);
+            if (recovered == address(0) || recovered != owner) revert InvalidPermitSignature();
+        } else {
+            // Contract: EIP-1271 fallback.
+            (bool ok, bytes memory ret) =
+                owner.staticcall(abi.encodeWithSelector(_ERC1271_MAGIC_VALUE, digest, sig));
+            if (!ok || ret.length < 32) revert InvalidPermitSignature();
+            if (abi.decode(ret, (bytes4)) != _ERC1271_MAGIC_VALUE) revert InvalidPermitSignature();
+        }
     }
 
     function _applyBatch(address owner, PermitBatch calldata batch) private {
         for (uint256 i; i < batch.tokens.length; i++) {
             TokenPermit calldata p = batch.tokens[i];
             PackedAllowance storage a = _tokenAllowance[owner][p.spender][p.token];
+            if (p.nonce != a.nonce) revert InvalidPermitNonce();
             a.amount = p.amount;
             a.expiration = p.expiration;
+            unchecked {
+                a.nonce = p.nonce + 1;
+            }
             emit TokenApproval(owner, p.spender, p.token, p.amount, p.expiration);
         }
         for (uint256 i; i < batch.takers.length; i++) {
             TakerPermit calldata p = batch.takers[i];
             PackedAllowance storage a = _takerAllowance[owner][p.module][p.ref];
+            if (p.nonce != a.nonce) revert InvalidPermitNonce();
             a.amount = p.amount;
             a.expiration = p.expiration;
+            unchecked {
+                a.nonce = p.nonce + 1;
+            }
             emit TakerApproval(owner, p.module, p.ref, p.amount, p.expiration);
         }
     }

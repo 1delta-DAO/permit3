@@ -22,6 +22,7 @@ interface IPermit3 {
         address token;
         uint160 amount;
         uint48 expiration;
+        uint48 nonce;
     }
 
     struct TakerPermit {
@@ -29,12 +30,12 @@ interface IPermit3 {
         bytes32 ref;
         uint160 amount;
         uint48 expiration;
+        uint48 nonce;
     }
 
     struct PermitBatch {
         TokenPermit[] tokens;
         TakerPermit[] takers;
-        uint256 nonce;
         uint256 deadline;
     }
 
@@ -46,7 +47,12 @@ interface IPermit3 {
     event TakerApproval(
         address indexed user, address indexed module, bytes32 indexed ref, uint160 amount, uint48 expiration
     );
-    event PermitBatchApplied(address indexed owner, uint256 indexed nonce);
+    event TokenNonceInvalidation(
+        address indexed user, address indexed spender, address indexed token, uint48 newNonce, uint48 oldNonce
+    );
+    event TakerNonceInvalidation(
+        address indexed user, address indexed module, bytes32 indexed ref, uint48 newNonce, uint48 oldNonce
+    );
     event Lockdown(address indexed user, address spender);
 
     // ──────────────────── Errors ────────────────────
@@ -56,7 +62,8 @@ interface IPermit3 {
     error Reentrancy();
     error PermitExpired();
     error InvalidPermitSignature();
-    error PermitNonceUsed();
+    error InvalidPermitNonce();
+    error ExcessiveInvalidation();
 
     // ──────────────────── Token side ────────────────────
 
@@ -125,5 +132,19 @@ interface IPermit3 {
         bytes calldata sig
     ) external;
 
-    function isPermitNonceUsed(address owner, uint256 nonce) external view returns (bool);
+    // ──────────────────── Nonce invalidation ────────────────────
+
+    /// @notice Advance the per-allowance nonce of `(caller, spender, token)`
+    ///         to `newNonce`, invalidating any outstanding signed permit
+    ///         whose `nonce` is strictly less than `newNonce`.
+    /// @dev    Strictly forward-only; reverts with `InvalidPermitNonce` if
+    ///         `newNonce <= oldNonce`, and with `ExcessiveInvalidation` if
+    ///         the bump exceeds `type(uint16).max` in one call (griefing
+    ///         bound matching Permit2).
+    function invalidateTokenNonces(address spender, address token, uint48 newNonce) external;
+
+    /// @notice Advance the per-allowance nonce of `(caller, module, ref)`.
+    ///         Same semantics as `invalidateTokenNonces` but for the taker
+    ///         book.
+    function invalidateTakerNonces(address module, bytes32 ref, uint48 newNonce) external;
 }

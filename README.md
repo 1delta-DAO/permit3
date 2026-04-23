@@ -69,14 +69,18 @@ unprivileged: the allowance is the only authorisation.
 ```
 src/
 ├── permit3/
-│   └── Permit3.sol            Allowance hub — token + taker books, take() dispatch
-└── interfaces/
-    ├── IPermit3.sol           External surface of Permit3
-    ├── ITakerModule.sol       Single-method adapter for pull-value ops
-    └── IMakerModule.sol       Single-method adapter for push-value ops
+│   └── Permit3.sol                Allowance hub — token + taker books, take() dispatch
+├── interfaces/
+│   ├── IPermit3.sol               External surface of Permit3
+│   ├── ITakerModule.sol           Single-method adapter for pull-value ops
+│   └── IMakerModule.sol           Single-method adapter for push-value ops
+└── modules/
+    ├── MorphoBlueBorrowModule.sol Borrow loan token from a Morpho Blue market
+    ├── CometWithdrawModule.sol    Withdraw base/collateral from a Compound V3 (Comet) instance
+    └── ERC721PullModule.sol       Pull a single ERC721 by (collection, tokenId)
 
 script/
-└── Deploy.s.sol               Permit3 deployment script
+└── Deploy.s.sol                   Permit3 deployment script
 ```
 
 See [`src/permit3/README.md`](src/permit3/README.md) for the full design
@@ -188,9 +192,17 @@ Implemented:
 - `ITakerModule` / `IMakerModule` single-method adapter interfaces.
 - EIP-712 `permitBatch` / `permitBatchWithWitness`.
 
+Reference taker modules (see [`src/modules/`](src/modules/)):
+- `MorphoBlueBorrowModule` — borrow from a Morpho Blue market (ref =
+  marketId).
+- `CometWithdrawModule` — withdraw base or collateral from a Comet
+  instance.
+- `ERC721PullModule` — pull a single ERC721 by (collection, tokenId);
+  turns collection-wide `setApprovalForAll` into per-tokenId, per-order
+  authorisation.
+
 Not yet implemented (contributions welcome):
-- Reference taker/maker modules for Aave v3, Comet, Morpho Blue,
-  Compound v2, Lido.
+- Reference taker/maker modules for Aave v3, Compound v2, Lido.
 - `revokeAll(module)` helper that also calls the module's per-protocol
   revoke path.
 - Foundry invariant suite asserting `data` round-trips cleanly through
