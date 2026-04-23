@@ -5,6 +5,15 @@ operations (borrow, withdraw, unstake, claim, vault redemption, …). Extends
 the [Permit2](https://github.com/Uniswap/permit2) model with a second
 allowance book for ops that don't fit the ERC20 `transferFrom` shape.
 
+The taker book is protocol-agnostic, so it also covers non-ERC20 value
+transfers — notably **NFTs (ERC721 / ERC1155)**, where the native
+approval primitives (`setApprovalForAll`, per-tokenId `approve`) are
+either collection-wide and unbounded or reset on every transfer. Routing
+an NFT pull through a small taker module gives users per-tokenId,
+per-order, amount-gated authorisation at the Permit3 layer while the
+operator flag stays set. See
+[`src/modules/ERC721PullModule.sol`](src/modules/ERC721PullModule.sol).
+
 ## Two allowance books
 
 ```
